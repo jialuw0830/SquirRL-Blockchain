@@ -1,0 +1,19 @@
+name: squirrl-py310
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.23
+  - scipy=1.10
+  - pandas=1.5
+  - matplotlib=3.7
+  - tensorflow=2.13
+  - gym=0.26
+  - pip:
+      - cloudpickle==2.2.1
+      - pyglet==1.5.27
+      - pymdptoolbox==4.0b3
+      - tf-slim
+
