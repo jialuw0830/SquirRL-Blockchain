@@ -14,13 +14,13 @@ from __future__ import division
 
 import gym
 import numpy as np
-import random
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
 import tf_slim as slim
 import matplotlib.pyplot as plt
 import scipy.misc
 import os
+import time
 from environment import SM_env
 from environment import random_normal_trunc
 from environment import eth_env
@@ -84,9 +84,9 @@ class Qnetwork():
         # Below we obtain the loss by taking the sum of squares difference between the target and prediction Q values.
         self.targetQ = tf.placeholder(shape=[None], dtype=tf.float32)
         self.actions = tf.placeholder(shape=[None], dtype=tf.int32)
-        self.actions_onehot = tf.one_hot(self.actions, action_space_n, dtype=tf.float32)
-
-        self.Q = tf.reduce_sum(tf.multiply(self.Qout, self.actions_onehot), axis=1)
+        batch_idx = tf.range(tf.shape(self.actions)[0])
+        indices = tf.stack([batch_idx, self.actions], axis=1)
+        self.Q = tf.gather_nd(self.Qout, indices)
 
         self.td_error = tf.square(self.targetQ - self.Q)
         self.loss = tf.reduce_mean(self.td_error)
@@ -129,37 +129,39 @@ class Qnetwork():
         return policy
 
 
-class experience_buffer():
-    def __init__(self, buffer_size=50000):
-        self.buffer = []
-        self.buffer_size = buffer_size
-
-    def add(self, experience):
-        #print(experience)
-        if len(self.buffer) + len(experience) >= self.buffer_size:
-            self.buffer[0:(len(experience) + len(self.buffer)) - self.buffer_size] = []
-        self.buffer.extend(experience)
-
-    def sample(self, size):
-        #print(self.buffer)
-        size = min(size, len(self.buffer))
-        return np.reshape(np.array(random.sample(self.buffer, size)), [size, 5])
-        #return random.sample(self.buffer, size)
-
-
-#def processState(states):
-#    return np.reshape(states, [21168])
-
 def updateTargetGraph(tfVars,tau):
     total_vars = len(tfVars)
     op_holder = []
     for idx,var in enumerate(tfVars[0:total_vars//2]):
-        op_holder.append(tfVars[idx+total_vars//2].assign((var.value()*tau) + ((1-tau)*tfVars[idx+total_vars//2].value())))
-    return op_holder
+        target_var = tfVars[idx+total_vars//2]
+        op_holder.append(target_var.assign(var * tau + target_var * (1.0 - tau)))
+    return tf.group(*op_holder)
 
-def updateTarget(op_holder,sess):
-    for op in op_holder:
-        sess.run(op)
+
+class ReplayBuffer:
+    def __init__(self, capacity, state_dim):
+        self.capacity = capacity
+        self.state_dim = state_dim
+        self.s = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.a = np.zeros((capacity,), dtype=np.int32)
+        self.r = np.zeros((capacity,), dtype=np.float32)
+        self.s1 = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.d = np.zeros((capacity,), dtype=np.float32)
+        self.ptr = 0
+        self.size = 0
+
+    def add(self, s, a, r, s1, d):
+        self.s[self.ptr] = s
+        self.a[self.ptr] = a
+        self.r[self.ptr] = r
+        self.s1[self.ptr] = s1
+        self.d[self.ptr] = float(d)
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size):
+        idx = np.random.randint(0, self.size, size=batch_size)
+        return self.s[idx], self.a[idx], self.r[idx], self.s1[idx], self.d[idx]
 
 
 def LOAD_MODEL(path):
@@ -197,6 +199,7 @@ pre_train_steps = 10000 #How many steps of random actions before training begins
 max_epLength = 10000 #The max allowed length of our episode.
 h_size = 100 #The size of the final convolutional layer before splitting it into Advantage and Value streams.
 tau = 0.001 #Rate to update target network toward primary network
+buffer_capacity = 50000
 MDP_size_threshold = 10000 # limit the MDP size that the MDP solver can finished in reasonable time
 interval = (0, 0.5) # the range of the alpha
 rept = 100 # final test repetition time
@@ -227,9 +230,9 @@ saver = tf.train.Saver()
 
 trainables = tf.trainable_variables()
 
-targetOps = updateTargetGraph(trainables,tau)
+targetOp = updateTargetGraph(trainables,tau)
 
-myBuffer = experience_buffer()
+myBuffer = ReplayBuffer(buffer_capacity, env._state_vector_n)
 
 #Set the rate of random action decrease.
 e = startE
@@ -246,7 +249,11 @@ history_best = 0
 if not os.path.exists(path):
     os.makedirs(path)
 
-with tf.Session() as sess:
+gpu_options = tf.GPUOptions(allow_growth=True)
+config = tf.ConfigProto(gpu_options=gpu_options, allow_soft_placement=True)
+config.gpu_options.force_gpu_compatible = True
+
+with tf.Session(config=config) as sess:
 
     sess.run(init)
     if load_model == True:
@@ -258,8 +265,10 @@ with tf.Session() as sess:
         print('Loading Best Model..')
         saver.restore(sess, best_path)
 
+    train_start = time.time()
+
     for i in range(num_episodes):
-        episodeBuffer = experience_buffer()
+        ep_start = time.time()
         #Reset environment and get first new observation
         s = env.reset()
 
@@ -284,35 +293,36 @@ with tf.Session() as sess:
             #ss1 = env._index_to_vector(s1)
 
             total_steps += 1
-            episodeBuffer.add(np.reshape(np.array([s,a,r,s1,d]),[1,5])) #Save the experience to our episode buffer.
+            s_array = np.asarray(s, dtype=np.float32)
+            s1_array = np.asarray(s1, dtype=np.float32)
+            myBuffer.add(s_array, a, r, s1_array, d)
             #episodeBuffer.add(ay([s,a,r,s1,d]),[1,5])) #Save the experience to our episode buffer.
 
             if total_steps > pre_train_steps:
                 if e > endE:
                     e -= stepDrop
 
-                if total_steps % (update_freq) == 0:
-                    trainBatch = myBuffer.sample(batch_size)  # Get a random batch of experiences.
-                    #print(trainBatch)
-                    # Below we perform the Double-DQN update to the target Q-values
-                    Q1 = sess.run(mainQN.predict, feed_dict={mainQN.vectorIn: np.reshape(np.vstack(trainBatch[:, 3]), [-1, env._state_vector_n])})
-                    Q2 = sess.run(targetQN.Qout, feed_dict={targetQN.vectorIn: np.reshape(np.vstack(trainBatch[:, 3]), [-1, env._state_vector_n])})
-                    end_multiplier = -(trainBatch[:, 4] - 1)
-                    doubleQ = Q2[range(batch_size), Q1]
-                    targetQ = trainBatch[:, 2] + (y * doubleQ * end_multiplier)
-                    # Update the network with our target values.
-                    _ = sess.run(mainQN.updateModel, \
-                                 feed_dict={mainQN.vectorIn: np.reshape(np.vstack(trainBatch[:, 0]), [-1, env._state_vector_n]), mainQN.targetQ: targetQ,
-                                            mainQN.actions: trainBatch[:, 1]})
-
-                    updateTarget(targetOps, sess)  # Update the target network toward the primary network.
+                if myBuffer.size >= batch_size and total_steps % (update_freq) == 0:
+                    bs, ba, br, bs1, bd = myBuffer.sample(batch_size)  # Get a random batch of experiences.
+                    s1_batch = np.asarray(bs1, dtype=np.float32).reshape(-1, env._state_vector_n)
+                    q_main_next, q_target_next = sess.run(
+                        [mainQN.Qout, targetQN.Qout],
+                        feed_dict={mainQN.vectorIn: s1_batch, targetQN.vectorIn: s1_batch}
+                    )
+                    a_next = np.argmax(q_main_next, axis=1)
+                    doubleQ = q_target_next[np.arange(len(a_next)), a_next]
+                    end_multiplier = 1.0 - bd
+                    targetQ = br + (y * doubleQ * end_multiplier)
+                    _ = sess.run([mainQN.updateModel, targetOp], \
+                                 feed_dict={mainQN.vectorIn: bs, mainQN.targetQ: targetQ,
+                                            mainQN.actions: ba})
             rAll += r
             s = s1
 
             if d == True:
                 break
 
-        myBuffer.add(episodeBuffer.buffer)
+        print("round = ", i, "training steps = ", j, "reward = ", rAll, "frac = ", env.reward_fraction, "elapsed_sec = ", time.time() - ep_start)
         print("round = ", i, "training steps = ", j, "reward = ", rAll, "frac = ", env.reward_fraction)
         print("round = ", i, "training steps = ", j, "reward = ", rAll, "frac = ", env.reward_fraction, file = file)
         #jList.append(j)
@@ -335,6 +345,9 @@ with tf.Session() as sess:
         #saver.save(sess,path+'/model-'+str(i)+'.ckpt')
 
     if num_episodes > 0:
+        total_time = time.time() - train_start
+        steps_per_sec = total_steps / max(total_time, 1e-6)
+        print("total_steps = ", total_steps, "total_time_sec = ", total_time, "steps_per_sec = ", steps_per_sec)
         print('history best = ', history_best)
         saver.restore(sess, best_path)
 
